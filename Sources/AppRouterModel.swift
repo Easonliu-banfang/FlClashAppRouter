@@ -86,6 +86,8 @@ final class AppRouterModel: ObservableObject {
     /// config.yaml 文件监听（机场切换/订阅更新都会重写它，借此实时刷新出口组）
     private var configWatcher: DispatchSourceFileSystemObject?
     private var configWatchWork: DispatchWorkItem?
+    /// 定时轮询 FLClash 设置（模式切换不会改 config.yaml 之外的触发点，靠它兜底）
+    private var refreshTimer: Timer?
 
     /// 刷新 UI 显示用的出口组名缓存（scan 完成 / 写入 / 恢复后调用）
     func refreshProxyTarget() {
@@ -265,6 +267,7 @@ final class AppRouterModel: ObservableObject {
         // 内部 defer 会调 refreshDerived()，无需再调一次
         loadAppliedPolicies()
         startWatchingConfig()
+        startPeriodicRefresh()
     }
 
     /// 全量扫描所有目录，返回 AppEntry 列表
@@ -646,23 +649,25 @@ final class AppRouterModel: ObservableObject {
     /// 这是 FLClash **自己保存的设置**，比 config.yaml 更可信——实测 config.yaml 里的
     /// `mode` 字段会与实际运行状态不符（写着 direct，但流量确实走了代理），
     /// 而 patchClashConfig 里的 mode / tun / find-process-mode 与实测行为完全一致。
+    private var cachedConfigRaw: String?
+    private var cachedConfigJSON: [String: Any]?
+
     private func flclashConfigJSON() -> [String: Any]? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
-        p.arguments = ["read", "com.follow.clash", "flutter.config"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        // 丢弃 stderr：若挂一个没人读的 Pipe，进程写满 64KB 管道缓冲会阻塞，
-        // 而 waitUntilExit() 会一直等 → 主线程被卡死（本函数会被 main queue 调用）。
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
-        var out = String(
-            data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        out = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        out = out.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        guard let data = out.data(using: .utf8) else { return nil }
-        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        // 直接读 UserDefaults（走 cfprefsd），不再 spawn /usr/bin/defaults 子进程。
+        // 本函数现在会被 2 秒一次的轮询调用，spawn 子进程太贵；UserDefaults 读是内存级开销。
+        // synchronize() 强制从 cfprefsd 重新取值，避免读到本进程内的旧缓存
+        // （FLClash 在另一个进程里改设置，不 sync 可能一直读到旧值 → 界面不刷新）。
+        guard let suite = UserDefaults(suiteName: "com.follow.clash") else { return nil }
+        _ = suite.synchronize()
+        guard let raw = suite.string(forKey: "flutter.config"), !raw.isEmpty else { return nil }
+        // 内容没变就复用上次解析结果，避免每 2 秒重复 JSON 解析 4.8KB
+        if raw == cachedConfigRaw, let cached = cachedConfigJSON { return cached }
+        guard let data = raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        cachedConfigRaw = raw
+        cachedConfigJSON = obj
+        return obj
     }
 
     /// FLClash 自己保存的 patchClashConfig —— 模式(mode)、TUN、find-process-mode 都在这里
@@ -1023,11 +1028,12 @@ final class AppRouterModel: ObservableObject {
         }
 
         // 标题栏显示当前模式（识别不了就不显示）
+        let newLabel: String
         switch mode {
-        case "rule": flclashModeLabel = "规则模式"
-        case "global": flclashModeLabel = "全局模式"
-        case "direct": flclashModeLabel = "直连模式"
-        default: flclashModeLabel = ""
+        case "rule": newLabel = "规则模式"
+        case "global": newLabel = "全局模式"
+        case "direct": newLabel = "直连模式"
+        default: newLabel = ""
         }
 
         var problems: [String] = []
@@ -1038,8 +1044,26 @@ final class AppRouterModel: ObservableObject {
         } else if mode == "direct" {
             problems.append("当前是直连模式，所有流量都不走代理，按软件分流无效")
         }
-        prerequisiteWarning =
+        let newWarning =
             problems.isEmpty ? "" : "FLClash 需要调整：" + problems.joined(separator: "；")
+
+        // 只在真的变了才写 @Published —— 本函数每 2 秒被轮询调用，
+        // 无条件赋值会每 2 秒让整个界面重绘一次（滚动时会顿）。
+        if flclashModeLabel != newLabel { flclashModeLabel = newLabel }
+        if prerequisiteWarning != newWarning { prerequisiteWarning = newWarning }
+    }
+
+    /// 定时轮询 FLClash 设置（TUN / find-process-mode / 模式）。
+    /// 之前只在「扫描完 / config.yaml 变化 / 重载后」检测，用户在 FLClash 里切模式
+    /// 不会触发任何回调，界面就一直显示旧模式。改为 2 秒轮询兜底。
+    /// 加入 .common 模式，保证滚动列表时也照常触发。
+    func startPeriodicRefresh() {
+        refreshTimer?.invalidate()
+        let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.checkPrerequisites()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        refreshTimer = t
     }
 
     /// FLClash 安装位置发现（分发到别的电脑的关键）。
