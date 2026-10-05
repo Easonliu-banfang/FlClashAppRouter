@@ -77,6 +77,8 @@ final class AppRouterModel: ObservableObject {
     /// 前置条件自检结果（为空 = 一切正常）。换机器分发后最关键的一项：
     /// 不满足时 PROCESS-NAME 规则根本不会命中，工具会「看起来正常但静默失效」。
     @Published var prerequisiteWarning: String = ""
+    /// FLClash 当前模式的中文标签（规则/全局/直连），标题栏展示用
+    @Published var flclashModeLabel: String = ""
 
     /// 防抖任务：改动后 1.2s 内连续改动只生效最后一次
     private var applyWorkItem: DispatchWorkItem?
@@ -640,8 +642,11 @@ final class AppRouterModel: ObservableObject {
         return nil
     }
 
-    /// 从 UserDefaults(com.follow.clash) flutter.config 取 currentProfileId
-    private func currentProfileIdFromDefaults() -> Int64? {
+    /// 读取 FLClash 的 UserDefaults(com.follow.clash → flutter.config) 并解析成字典。
+    /// 这是 FLClash **自己保存的设置**，比 config.yaml 更可信——实测 config.yaml 里的
+    /// `mode` 字段会与实际运行状态不符（写着 direct，但流量确实走了代理），
+    /// 而 patchClashConfig 里的 mode / tun / find-process-mode 与实测行为完全一致。
+    private func flclashConfigJSON() -> [String: Any]? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
         p.arguments = ["read", "com.follow.clash", "flutter.config"]
@@ -656,11 +661,19 @@ final class AppRouterModel: ObservableObject {
             data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         out = out.trimmingCharacters(in: .whitespacesAndNewlines)
         out = out.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        guard let data = out.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let id = obj["currentProfileId"] as? Int64
-        else { return nil }
-        return id
+        guard let data = out.data(using: .utf8) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    /// FLClash 自己保存的 patchClashConfig —— 模式(mode)、TUN、find-process-mode 都在这里
+    private func flclashPatch() -> [String: Any]? {
+        flclashConfigJSON()?["patchClashConfig"] as? [String: Any]
+    }
+
+    /// 从 UserDefaults(com.follow.clash) flutter.config 取 currentProfileId
+    private func currentProfileIdFromDefaults() -> Int64? {
+        guard let obj = flclashConfigJSON() else { return nil }
+        return obj["currentProfileId"] as? Int64
     }
 
     /// 从某个 YAML 文本里收集 proxy-groups: 段下的所有组名
@@ -940,58 +953,93 @@ final class AppRouterModel: ObservableObject {
         }
     }
 
-    /// 检查 PROCESS-NAME 规则能否真正命中，两个硬前提缺一不可：
+    /// 检测 FLClash 当前设置能否让「按软件分流」真正生效。三项缺一不可：
     ///   ① TUN 模式开启 —— 不开 TUN，很多 App 的流量根本不进内核
     ///   ② find-process-mode 为 always/strict —— 为 off 时内核不做进程反查，规则永远不命中
-    /// 本机默认满足，但换一台电脑后用户未必开过，所以必须自检并明确提示。
+    ///   ③ **模式为「规则」** —— 全局模式下所有流量都走代理、直连模式下全部不走代理，
+    ///      这两种模式下 rules 段会被整体忽略，按软件分流形同虚设
+    /// 数据源优先用 FLClash 自己的 patchClashConfig：实测 config.yaml 的 mode 字段
+    /// 会写 direct 而实际在走代理（不可信），patchClashConfig 与实测行为一致。
+    /// 结果写入 prerequisiteWarning（告警条）与 flclashModeLabel（标题栏显示当前模式）。
     func checkPrerequisites() {
-        guard let text = try? String(contentsOfFile: configPath, encoding: .utf8) else {
-            prerequisiteWarning =
-                "未检测到 FLClash 配置，请先安装并至少启动一次 FLClash（https://github.com/chen08209/FlClash）"
-            return
-        }
-        let lines = text.components(separatedBy: "\n")
-        // ① find-process-mode
-        var fpmOK = false
-        for l in lines {
-            let t = l.trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("find-process-mode:") {
-                let v = t.dropFirst("find-process-mode:".count)
-                    .trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'"))
-                    .lowercased()
-                fpmOK = (v == "always" || v == "strict")
-                break
-            }
-        }
-        // ② tun.enable（只看 tun: 段内的缩进项，避免误读别处的 enable）
         var tunOK = false
-        if let ti = lines.firstIndex(where: {
-            $0.trimmingCharacters(in: .whitespaces) == "tun:"
-        }) {
-            for i in (ti + 1)..<min(ti + 12, lines.count) {
-                let raw = lines[i]
-                let t = raw.trimmingCharacters(in: .whitespaces)
-                if t.isEmpty { continue }
-                if !raw.hasPrefix(" ") && !raw.hasPrefix("\t") { break }  // 回到顶层键 = 离开 tun 段
-                if t.hasPrefix("enable:") {
-                    let v = t.dropFirst("enable:".count)
+        var fpmOK = false
+        var mode = ""
+
+        if let patch = flclashPatch() {
+            if let tun = patch["tun"] as? [String: Any], let e = tun["enable"] as? Bool {
+                tunOK = e
+            }
+            let fpm = (patch["find-process-mode"] as? String ?? "").lowercased()
+            fpmOK = (fpm == "always" || fpm == "strict")
+            mode = (patch["mode"] as? String ?? "").lowercased()
+        } else {
+            // 退化：UserDefaults 读不到时，直接解析 config.yaml
+            guard let text = try? String(contentsOfFile: configPath, encoding: .utf8) else {
+                prerequisiteWarning =
+                    "未检测到 FLClash 设置，请先安装并至少启动一次 FLClash"
+                    + "（https://github.com/chen08209/FlClash）"
+                flclashModeLabel = ""
+                return
+            }
+            let lines = text.components(separatedBy: "\n")
+            for l in lines {
+                let t = l.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("find-process-mode:") {
+                    let v = t.dropFirst("find-process-mode:".count)
                         .trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'"))
                         .lowercased()
-                    tunOK = (v == "true")
+                    fpmOK = (v == "always" || v == "strict")
+                    break
+                }
+            }
+            // tun.enable（只看 tun: 段内的缩进项，避免误读别处的 enable）
+            if let ti = lines.firstIndex(where: {
+                $0.trimmingCharacters(in: .whitespaces) == "tun:"
+            }) {
+                for i in (ti + 1)..<min(ti + 12, lines.count) {
+                    let raw = lines[i]
+                    let t = raw.trimmingCharacters(in: .whitespaces)
+                    if t.isEmpty { continue }
+                    if !raw.hasPrefix(" ") && !raw.hasPrefix("\t") { break }  // 回到顶层键 = 离开 tun 段
+                    if t.hasPrefix("enable:") {
+                        let v = t.dropFirst("enable:".count)
+                            .trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'"))
+                            .lowercased()
+                        tunOK = (v == "true")
+                        break
+                    }
+                }
+            }
+            for l in lines {
+                let t = l.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("mode:") {
+                    mode = t.dropFirst("mode:".count)
+                        .trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'"))
+                        .lowercased()
                     break
                 }
             }
         }
-        if !fpmOK && !tunOK {
-            prerequisiteWarning = "FLClash 未开 TUN 且 find-process-mode 为 off：按软件分流不会生效"
-        } else if !fpmOK {
-            prerequisiteWarning =
-                "FLClash 的 find-process-mode 为 off：内核不反查进程，规则不会命中"
-        } else if !tunOK {
-            prerequisiteWarning = "FLClash 未开启 TUN 模式：部分 App 流量不进内核，规则可能不命中"
-        } else {
-            prerequisiteWarning = ""
+
+        // 标题栏显示当前模式（识别不了就不显示）
+        switch mode {
+        case "rule": flclashModeLabel = "规则模式"
+        case "global": flclashModeLabel = "全局模式"
+        case "direct": flclashModeLabel = "直连模式"
+        default: flclashModeLabel = ""
         }
+
+        var problems: [String] = []
+        if !tunOK { problems.append("未开启 TUN 模式") }
+        if !fpmOK { problems.append("find-process-mode 为 off（内核不反查进程）") }
+        if mode == "global" {
+            problems.append("当前是全局模式，所有流量都走代理，按软件分流无效")
+        } else if mode == "direct" {
+            problems.append("当前是直连模式，所有流量都不走代理，按软件分流无效")
+        }
+        prerequisiteWarning =
+            problems.isEmpty ? "" : "FLClash 需要调整：" + problems.joined(separator: "；")
     }
 
     /// FLClash 安装位置发现（分发到别的电脑的关键）。

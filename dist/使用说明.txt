@@ -30,8 +30,10 @@ FLClash 官方 macOS 端没有这个面板（只有 Android 有），所以用�
 --------
   1. 必须已安装并运行 FLClash（https://github.com/chen08209/FlClash）
      FLClash 装在哪个文件夹都可以（应用程序、用户目录、外接盘都行），本工具会自动找到它。
-  2. FLClash 里需开启 TUN 模式，且 find-process-mode 为 strict 或 always
-     这两项不满足时，本工具顶部会显示橙色提示条告诉你是哪一项没开。
+  2. FLClash 里需开启 TUN 模式，find-process-mode 为 strict 或 always，
+     且模式必须是「规则模式」（全局模式/直连模式下按软件分流会被整体忽略）
+     以上任一不满足时，本工具顶部会显示橙色提示条告诉你是哪一项没开，
+     标题栏也会实时显示 FLClash 当前处于规则/全局/直连哪种模式。
   3. 首次使用请先在 FLClash 里「更新订阅」，确保配置里有 rules 段
 
 
@@ -75,4 +77,4 @@ A：App 不联网、不收集任何数据，只读写本机 FLClash 的配置文
 
 版本
 ----
-  2.3
+  2.4

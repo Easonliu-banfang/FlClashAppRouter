@@ -4,7 +4,7 @@
 
 > 为什么需要它：FLClash 的「应用分流」面板 **只有 Android 端有**（基于 uid），macOS 端官方没做。本工具用进程名规则补上这一块。
 
-**当前版本：v2.3** · [下载最新版 DMG](https://github.com/Easonliu-banfang/FlClashAppRouter/releases/latest)
+**当前版本：v2.4** · [下载最新版 DMG](https://github.com/Easonliu-banfang/FlClashAppRouter/releases/latest)
 
 ---
 
@@ -25,9 +25,10 @@
 | 已安装并运行 FLClash | [github.com/chen08209/FlClash](https://github.com/chen08209/FlClash) |
 | FLClash 开启 **TUN 模式** | 不开 TUN，很多 App 的流量根本不进内核 |
 | `find-process-mode` 为 `strict` 或 `always` | 为 `off` 时内核不反查进程，规则永远不命中 |
+| FLClash 模式为 **规则模式** | 全局模式下所有流量都走代理、直连模式下全部不走代理，这两种模式下 `rules:` 段会被整体忽略，按软件分流形同虚设 |
 | 配置里有 `rules:` 段 | 订阅档需先在 FLClash 里「更新订阅」 |
 
-**不满足时工具顶部会显示橙色提示条**，明确告诉你是哪一项没开，不会让你对着一个"没反应"的界面猜。
+**这四项工具都会自动检测**：标题栏实时显示 FLClash 当前模式（规则/全局/直连），任一前提不满足时顶部弹出橙色提示条，明确告诉你是哪一项——不会让你对着一个"没反应"的界面猜。
 
 ## 怎么用
 

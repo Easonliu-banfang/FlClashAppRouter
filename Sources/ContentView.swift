@@ -62,9 +62,21 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("按软件分流")
                     .font(.system(size: 15, weight: .semibold))
-                Text("出口组：\(model.proxyTargetName)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text("出口组：\(model.proxyTargetName)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if !model.flclashModeLabel.isEmpty {
+                        Text("·")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                        // 模式不对（全局/直连）时标橙，与上方告警条呼应
+                        Text(model.flclashModeLabel)
+                            .font(.caption2)
+                            .foregroundStyle(
+                                model.prerequisiteWarning.isEmpty ? Color.secondary : Color.orange)
+                    }
+                }
             }
             Spacer()
 
