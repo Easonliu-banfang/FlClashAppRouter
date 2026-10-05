@@ -29,6 +29,14 @@ enum RoutePolicy: String, CaseIterable, Identifiable {
     }
 }
 
+/// 一条「必须解决才能用」的前置问题：标题 + 具体怎么修
+struct PrereqIssue: Identifiable {
+    let id = UUID()
+    let icon: String  // SF Symbol
+    let title: String
+    let hint: String
+}
+
 /// 一个可被 PROCESS-NAME / PROCESS-PATH 匹配的进程
 struct ProcSpec {
     let name: String  // 进程名（basename）
@@ -74,11 +82,16 @@ final class AppRouterModel: ObservableObject {
     @Published var countRouted: Int = 0
     @Published var countProxy: Int = 0
     @Published var countDirect: Int = 0
-    /// 前置条件自检结果（为空 = 一切正常）。换机器分发后最关键的一项：
-    /// 不满足时 PROCESS-NAME 规则根本不会命中，工具会「看起来正常但静默失效」。
-    @Published var prerequisiteWarning: String = ""
+    /// 前置条件自检结果。非空 = 存在「必须解决才能用」的问题 → 界面被拦截页接管。
+    /// 换机器分发后最关键的一项：不满足时 PROCESS-NAME 规则根本不会命中，
+    /// 工具会「看起来正常但静默失效」，所以宁可拦住也不让用户带着坏配置操作。
+    @Published var prereqIssues: [PrereqIssue] = []
+    /// 是否已完成首次检测（未完成时先显示「检测中」，避免主界面闪一下再被拦）
+    @Published var prereqChecked = false
+    /// 诊断信息：把实际读到的原始值摊开，万一检测有误用户能直接看到原因
+    @Published var prereqDiagnostics: String = ""
     /// FLClash 当前状态标签（如「规则模式 · TUN 已开」），标题栏实时展示用。
-    /// 与 prerequisiteWarning 一样由 2 秒轮询刷新。
+    /// 与 prereqIssues 一样由 1 秒轮询刷新。
     @Published var flclashStatusLabel: String = ""
 
     /// 防抖任务：改动后 1.2s 内连续改动只生效最后一次
@@ -964,15 +977,17 @@ final class AppRouterModel: ObservableObject {
     ///   ② find-process-mode 为 always/strict —— 为 off 时内核不做进程反查，规则永远不命中
     ///   ③ **模式为「规则」** —— 全局模式下所有流量都走代理、直连模式下全部不走代理，
     ///      这两种模式下 rules 段会被整体忽略，按软件分流形同虚设
-    /// 数据源优先用 FLClash 自己的 patchClashConfig：实测 config.yaml 的 mode 字段
-    /// 会写 direct 而实际在走代理（不可信），patchClashConfig 与实测行为一致。
-    /// 结果写入 prerequisiteWarning（告警条）与 flclashStatusLabel（标题栏状态标签）。
+    /// 数据源优先用 FLClash 自己的 patchClashConfig：实测 config.yaml 的 mode / tun 字段
+    /// 都会滞后于实际状态（写 direct 但实际在走代理；写 tun.enable: true 但路由表里
+    /// 没有任何指向 utun 的条目），patchClashConfig 才与实测行为一致。
+    /// 结果写入 prereqIssues（拦截页）与 flclashStatusLabel（标题栏状态标签）。
     func checkPrerequisites() {
         var tunOK = false
         var tunKnown = false  // 读不到时不要误报「未开启」
         var fpmOK = false
         var fpmKnown = false
         var mode = ""
+        var source = "patchClashConfig"
 
         if let patch = flclashPatch() {
             if let tun = patch["tun"] as? [String: Any], let e = tun["enable"] as? Bool {
@@ -987,11 +1002,16 @@ final class AppRouterModel: ObservableObject {
             mode = (patch["mode"] as? String ?? "").lowercased()
         } else {
             // 退化：UserDefaults 读不到时，直接解析 config.yaml
+            source = "config.yaml"
             guard let text = try? String(contentsOfFile: configPath, encoding: .utf8) else {
-                prerequisiteWarning =
-                    "未检测到 FLClash 设置，请先安装并至少启动一次 FLClash"
-                    + "（https://github.com/chen08209/FlClash）"
-                flclashStatusLabel = ""
+                let issues = [
+                    PrereqIssue(
+                        icon: "questionmark.folder",
+                        title: "未检测到 FLClash 设置",
+                        hint: "请先安装并至少启动一次 FLClash"
+                            + "（https://github.com/chen08209/FlClash），再点「重新检测」。")
+                ]
+                applyPrereq(issues: issues, label: "", diagnostics: "未找到 UserDefaults 与 config.yaml")
                 return
             }
             let lines = text.components(separatedBy: "\n")
@@ -1047,21 +1067,68 @@ final class AppRouterModel: ObservableObject {
         if tunKnown { parts.append(tunOK ? "TUN 已开" : "TUN 未开") }
         let newLabel = parts.joined(separator: " · ")
 
-        var problems: [String] = []
-        if tunKnown && !tunOK { problems.append("未开启 TUN 模式") }
-        if fpmKnown && !fpmOK { problems.append("find-process-mode 为 off（内核不反查进程）") }
-        if mode == "global" {
-            problems.append("当前是全局模式，所有流量都走代理，按软件分流无效")
-        } else if mode == "direct" {
-            problems.append("当前是直连模式，所有流量都不走代理，按软件分流无效")
+        // ── 构造「必须解决」的问题清单（每条都带具体修复步骤）──
+        var issues: [PrereqIssue] = []
+        if tunKnown && !tunOK {
+            issues.append(
+                PrereqIssue(
+                    icon: "shield.slash",
+                    title: "TUN 模式未开启",
+                    hint: "打开 FLClash → 首页 → 打开「TUN」开关。不开 TUN，很多 App 的流量"
+                        + "根本不进内核，进程规则永远不会命中。"))
         }
-        let newWarning =
-            problems.isEmpty ? "" : "FLClash 需要调整：" + problems.joined(separator: "；")
+        if fpmKnown && !fpmOK {
+            issues.append(
+                PrereqIssue(
+                    icon: "magnifyingglass",
+                    title: "find-process-mode 为 off",
+                    hint: "内核不会反查连接属于哪个进程，PROCESS-NAME 规则永远不命中。"
+                        + "在 FLClash 的「覆写」里把它设为 strict 或 always。"))
+        }
+        if mode == "global" {
+            issues.append(
+                PrereqIssue(
+                    icon: "globe.asia.australia.fill",
+                    title: "当前是「全局模式」",
+                    hint: "全局模式下所有流量都走代理，rules 段被整体忽略，按软件分流无效。"
+                        + "请在 FLClash 首页把模式切到「规则」。"))
+        } else if mode == "direct" {
+            issues.append(
+                PrereqIssue(
+                    icon: "arrow.right.circle.fill",
+                    title: "当前是「直连模式」",
+                    hint: "直连模式下所有流量都不走代理，rules 段被整体忽略，按软件分流无效。"
+                        + "请在 FLClash 首页把模式切到「规则」。"))
+        }
 
-        // 只在真的变了才写 @Published —— 本函数被轮询高频调用，
-        // 无条件赋值会让整个界面每次轮询都重绘一次（滚动时会顿）。
-        if flclashStatusLabel != newLabel { flclashStatusLabel = newLabel }
-        if prerequisiteWarning != newWarning { prerequisiteWarning = newWarning }
+        let diag = [
+            "数据源: \(source)",
+            "mode: \(mode.isEmpty ? "(未读到)" : mode)",
+            "tun.enable: \(tunKnown ? (tunOK ? "true" : "false") : "(未读到)")",
+            "find-process-mode: \(fpmKnown ? (fpmOK ? "ok" : "off") : "(未读到)")",
+        ].joined(separator: "\n")
+        applyPrereq(issues: issues, label: newLabel, diagnostics: diag)
+    }
+
+    /// 把检测结果落到 @Published 上。**只在内容真的变化时才赋值**——
+    /// 本函数被 1 秒轮询调用，无条件赋值会让整个界面每秒重绘一次；
+    /// 而且 PrereqIssue 带 UUID，每次重建都会让 ForEach 认为全是新行。
+    private func applyPrereq(issues: [PrereqIssue], label: String, diagnostics: String) {
+        let newSig = issues.map { $0.title }.joined(separator: "|")
+        let oldSig = prereqIssues.map { $0.title }.joined(separator: "|")
+        if newSig != oldSig { prereqIssues = issues }
+        if flclashStatusLabel != label { flclashStatusLabel = label }
+        if prereqDiagnostics != diagnostics { prereqDiagnostics = diagnostics }
+        if !prereqChecked { prereqChecked = true }
+    }
+
+    /// 打开 FLClash（拦截页的「打开 FLClash」按钮）
+    func openFlClash() {
+        guard let appPath = flclashAppPath() else { return }
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = ["-a", appPath]
+        try? open.run()
     }
 
     /// 定时轮询 FLClash 设置（TUN / find-process-mode / 模式），1 秒一次。

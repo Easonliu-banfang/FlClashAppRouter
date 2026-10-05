@@ -24,14 +24,26 @@ struct ContentView: View {
     }
 
     var body: some View {
+        Group {
+            if !model.prereqChecked {
+                prereqCheckingView
+            } else if !model.prereqIssues.isEmpty {
+                // 有问题就整页拦截：带着坏配置操作只会让人以为「工具坏了」
+                prereqGateView
+            } else {
+                mainView
+            }
+        }
+        .frame(minWidth: 720, minHeight: 560)
+        .onAppear { if model.apps.isEmpty { model.scan() } }
+    }
+
+    // ── 主界面（前置条件全部满足后才可见）──
+    private var mainView: some View {
         VStack(spacing: 0) {
             header
 
             modeCard
-
-            if !model.prerequisiteWarning.isEmpty {
-                prerequisiteBanner
-            }
 
             if model.appRoutingEnabled {
                 if !model.apps.isEmpty { searchBar }
@@ -49,8 +61,6 @@ struct ContentView: View {
                 rulesPreview
             }
         }
-        .frame(minWidth: 720, minHeight: 560)
-        .onAppear { if model.apps.isEmpty { model.scan() } }
     }
 
     // ── 顶部标题栏 ──
@@ -70,11 +80,10 @@ struct ContentView: View {
                         Text("·")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
-                        // 模式/TUN 不正常时标橙，与上方告警条呼应
+                        // 能走到这里说明前置条件都通过了（否则整页被拦截页接管）
                         Text(model.flclashStatusLabel)
                             .font(.caption2)
-                            .foregroundStyle(
-                                model.prerequisiteWarning.isEmpty ? Color.secondary : Color.orange)
+                            .foregroundStyle(Color.secondary)
                     }
                 }
             }
@@ -171,20 +180,146 @@ struct ContentView: View {
         }
     }
 
-    // ── 前置条件告警条（TUN / find-process-mode 不满足时）──
-    // 换一台电脑后这两个前提未必满足，不满足时规则会静默失效，必须显式告诉用户。
-    private var prerequisiteBanner: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 11))
-            Text(model.prerequisiteWarning)
-                .font(.caption)
-            Spacer()
+    // ── 检测中占位（避免主界面闪一下再被拦）──
+    private var prereqCheckingView: some View {
+        VStack(spacing: 14) {
+            ProgressView().controlSize(.large)
+            Text("正在检测 FLClash 环境…")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
         }
-        .foregroundStyle(.orange)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // ── 前置条件拦截页 ──
+    // 任一前提不满足就整页接管。每秒轮询，在 FLClash 里改好后自动放行，不用回来点按钮。
+    private var prereqGateView: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                ZStack {
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.orange.opacity(0.22), Color.orange.opacity(0.05)],
+                                startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
+                        .frame(width: 116, height: 116)
+                    Circle()
+                        .strokeBorder(Color.orange.opacity(0.28), lineWidth: 1)
+                        .frame(width: 116, height: 116)
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 52, weight: .medium))
+                        .foregroundStyle(Color.orange)
+                }
+                .padding(.top, 12)
+
+                Text("先完成 FLClash 设置")
+                    .font(.system(size: 26, weight: .bold))
+                    .padding(.top, 22)
+
+                Text(
+                    "以下 \(model.prereqIssues.count) 项会让「按软件分流」完全失效，解决后自动进入"
+                )
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .padding(.top, 8)
+
+                VStack(spacing: 10) {
+                    ForEach(Array(model.prereqIssues.enumerated()), id: \.element.id) { idx, issue in
+                        issueCard(index: idx + 1, issue: issue)
+                    }
+                }
+                .frame(maxWidth: 560)
+                .padding(.top, 24)
+
+                HStack(spacing: 12) {
+                    Button {
+                        model.openFlClash()
+                    } label: {
+                        Label("打开 FLClash", systemImage: "arrow.up.forward.app.fill")
+                            .frame(minWidth: 118)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+
+                    Button {
+                        model.checkPrerequisites()
+                    } label: {
+                        Label("重新检测", systemImage: "arrow.clockwise")
+                            .frame(minWidth: 96)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                }
+                .padding(.top, 28)
+
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("每秒自动检测，在 FLClash 里改好即可")
+                }
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .padding(.top, 16)
+
+                // 检测详情：万一判断有误，用户能直接看到实际读到了什么
+                DisclosureGroup("检测详情") {
+                    Text(model.prereqDiagnostics)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
+                }
+                .font(.caption)
+                .frame(maxWidth: 560)
+                .padding(.top, 24)
+                .padding(.bottom, 20)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .background(
+            LinearGradient(
+                colors: [Color.orange.opacity(0.06), Color.clear],
+                startPoint: .top, endPoint: .center)
+        )
+    }
+
+    private func issueCard(index: Int, issue: PrereqIssue) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(Color.orange.opacity(0.15))
+                    .frame(width: 32, height: 32)
+                Image(systemName: issue.icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Color.orange)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text("\(index).")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Color.orange)
+                    Text(issue.title)
+                        .font(.system(size: 14, weight: .semibold))
+                }
+                Text(issue.hint)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(2)
+            }
+            Spacer(minLength: 0)
+        }
         .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(Color.orange.opacity(0.10))
+        .padding(.vertical, 14)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(NSColor.controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.orange.opacity(0.28), lineWidth: 1)
+        )
     }
 
     // ── 原有规则说明页 ──
