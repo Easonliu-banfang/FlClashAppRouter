@@ -77,8 +77,9 @@ final class AppRouterModel: ObservableObject {
     /// 前置条件自检结果（为空 = 一切正常）。换机器分发后最关键的一项：
     /// 不满足时 PROCESS-NAME 规则根本不会命中，工具会「看起来正常但静默失效」。
     @Published var prerequisiteWarning: String = ""
-    /// FLClash 当前模式的中文标签（规则/全局/直连），标题栏展示用
-    @Published var flclashModeLabel: String = ""
+    /// FLClash 当前状态标签（如「规则模式 · TUN 已开」），标题栏实时展示用。
+    /// 与 prerequisiteWarning 一样由 2 秒轮询刷新。
+    @Published var flclashStatusLabel: String = ""
 
     /// 防抖任务：改动后 1.2s 内连续改动只生效最后一次
     private var applyWorkItem: DispatchWorkItem?
@@ -965,18 +966,24 @@ final class AppRouterModel: ObservableObject {
     ///      这两种模式下 rules 段会被整体忽略，按软件分流形同虚设
     /// 数据源优先用 FLClash 自己的 patchClashConfig：实测 config.yaml 的 mode 字段
     /// 会写 direct 而实际在走代理（不可信），patchClashConfig 与实测行为一致。
-    /// 结果写入 prerequisiteWarning（告警条）与 flclashModeLabel（标题栏显示当前模式）。
+    /// 结果写入 prerequisiteWarning（告警条）与 flclashStatusLabel（标题栏状态标签）。
     func checkPrerequisites() {
         var tunOK = false
+        var tunKnown = false  // 读不到时不要误报「未开启」
         var fpmOK = false
+        var fpmKnown = false
         var mode = ""
 
         if let patch = flclashPatch() {
             if let tun = patch["tun"] as? [String: Any], let e = tun["enable"] as? Bool {
                 tunOK = e
+                tunKnown = true
             }
             let fpm = (patch["find-process-mode"] as? String ?? "").lowercased()
-            fpmOK = (fpm == "always" || fpm == "strict")
+            if !fpm.isEmpty {
+                fpmOK = (fpm == "always" || fpm == "strict")
+                fpmKnown = true
+            }
             mode = (patch["mode"] as? String ?? "").lowercased()
         } else {
             // 退化：UserDefaults 读不到时，直接解析 config.yaml
@@ -984,7 +991,7 @@ final class AppRouterModel: ObservableObject {
                 prerequisiteWarning =
                     "未检测到 FLClash 设置，请先安装并至少启动一次 FLClash"
                     + "（https://github.com/chen08209/FlClash）"
-                flclashModeLabel = ""
+                flclashStatusLabel = ""
                 return
             }
             let lines = text.components(separatedBy: "\n")
@@ -995,6 +1002,7 @@ final class AppRouterModel: ObservableObject {
                         .trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'"))
                         .lowercased()
                     fpmOK = (v == "always" || v == "strict")
+                    fpmKnown = true
                     break
                 }
             }
@@ -1012,6 +1020,7 @@ final class AppRouterModel: ObservableObject {
                             .trimmingCharacters(in: CharacterSet(charactersIn: " \t\"'"))
                             .lowercased()
                         tunOK = (v == "true")
+                        tunKnown = true
                         break
                     }
                 }
@@ -1027,18 +1036,20 @@ final class AppRouterModel: ObservableObject {
             }
         }
 
-        // 标题栏显示当前模式（识别不了就不显示）
-        let newLabel: String
+        // 标题栏状态标签：模式 + TUN（识别不了就不显示）
+        var parts: [String] = []
         switch mode {
-        case "rule": newLabel = "规则模式"
-        case "global": newLabel = "全局模式"
-        case "direct": newLabel = "直连模式"
-        default: newLabel = ""
+        case "rule": parts.append("规则模式")
+        case "global": parts.append("全局模式")
+        case "direct": parts.append("直连模式")
+        default: break
         }
+        if tunKnown { parts.append(tunOK ? "TUN 已开" : "TUN 未开") }
+        let newLabel = parts.joined(separator: " · ")
 
         var problems: [String] = []
-        if !tunOK { problems.append("未开启 TUN 模式") }
-        if !fpmOK { problems.append("find-process-mode 为 off（内核不反查进程）") }
+        if tunKnown && !tunOK { problems.append("未开启 TUN 模式") }
+        if fpmKnown && !fpmOK { problems.append("find-process-mode 为 off（内核不反查进程）") }
         if mode == "global" {
             problems.append("当前是全局模式，所有流量都走代理，按软件分流无效")
         } else if mode == "direct" {
@@ -1047,19 +1058,20 @@ final class AppRouterModel: ObservableObject {
         let newWarning =
             problems.isEmpty ? "" : "FLClash 需要调整：" + problems.joined(separator: "；")
 
-        // 只在真的变了才写 @Published —— 本函数每 2 秒被轮询调用，
-        // 无条件赋值会每 2 秒让整个界面重绘一次（滚动时会顿）。
-        if flclashModeLabel != newLabel { flclashModeLabel = newLabel }
+        // 只在真的变了才写 @Published —— 本函数被轮询高频调用，
+        // 无条件赋值会让整个界面每次轮询都重绘一次（滚动时会顿）。
+        if flclashStatusLabel != newLabel { flclashStatusLabel = newLabel }
         if prerequisiteWarning != newWarning { prerequisiteWarning = newWarning }
     }
 
-    /// 定时轮询 FLClash 设置（TUN / find-process-mode / 模式）。
-    /// 之前只在「扫描完 / config.yaml 变化 / 重载后」检测，用户在 FLClash 里切模式
-    /// 不会触发任何回调，界面就一直显示旧模式。改为 2 秒轮询兜底。
+    /// 定时轮询 FLClash 设置（TUN / find-process-mode / 模式），1 秒一次。
+    /// 之前只在「扫描完 / config.yaml 变化 / 重载后」检测，用户在 FLClash 里切模式或
+    /// 开关 TUN 不会触发任何回调，界面就一直显示旧状态。
     /// 加入 .common 模式，保证滚动列表时也照常触发。
+    /// 开销很低：一次 UserDefaults 读取（走 cfprefsd），内容没变时连 JSON 都不解析。
     func startPeriodicRefresh() {
         refreshTimer?.invalidate()
-        let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.checkPrerequisites()
         }
         RunLoop.main.add(t, forMode: .common)

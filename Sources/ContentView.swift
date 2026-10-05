@@ -66,12 +66,12 @@ struct ContentView: View {
                     Text("出口组：\(model.proxyTargetName)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                    if !model.flclashModeLabel.isEmpty {
+                    if !model.flclashStatusLabel.isEmpty {
                         Text("·")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
-                        // 模式不对（全局/直连）时标橙，与上方告警条呼应
-                        Text(model.flclashModeLabel)
+                        // 模式/TUN 不正常时标橙，与上方告警条呼应
+                        Text(model.flclashStatusLabel)
                             .font(.caption2)
                             .foregroundStyle(
                                 model.prerequisiteWarning.isEmpty ? Color.secondary : Color.orange)
