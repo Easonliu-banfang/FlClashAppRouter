@@ -233,33 +233,67 @@ struct ContentView: View {
                 .padding(.top, 24)
 
                 HStack(spacing: 12) {
+                    if model.prereqAutoFixable {
+                        Button {
+                            model.autoFix()
+                        } label: {
+                            Label("自动修复", systemImage: "wand.and.stars")
+                                .frame(minWidth: 118)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                        .disabled(model.isAutoFixing)
+                    } else {
+                        Button {
+                            model.checkPrerequisites()
+                        } label: {
+                            Label("重新检测", systemImage: "arrow.clockwise")
+                                .frame(minWidth: 118)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                    }
+
                     Button {
                         model.openFlClash()
                     } label: {
                         Label("打开 FLClash", systemImage: "arrow.up.forward.app.fill")
-                            .frame(minWidth: 118)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-
-                    Button {
-                        model.checkPrerequisites()
-                    } label: {
-                        Label("重新检测", systemImage: "arrow.clockwise")
-                            .frame(minWidth: 96)
+                            .frame(minWidth: 112)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
                 }
                 .padding(.top, 28)
 
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.small)
-                    Text("每秒自动检测，在 FLClash 里改好即可")
+                if model.isAutoFixing {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("正在写入设置并重启 FLClash…")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 16)
+                } else if !model.autoFixMessage.isEmpty {
+                    Text(model.autoFixMessage)
+                        .font(.caption)
+                        .foregroundStyle(model.prereqIssues.isEmpty ? Color.green : Color.orange)
+                        .padding(.top, 16)
+                } else {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("每秒自动检测，也可以自己在 FLClash 里改好")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 16)
                 }
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .padding(.top, 16)
+
+                if model.prereqAutoFixable {
+                    Text("自动修复会开启 TUN、把 find-process-mode 设为 always、模式切到规则，并重启 FLClash")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 8)
+                }
 
                 // 检测详情：万一判断有误，用户能直接看到实际读到了什么
                 DisclosureGroup("检测详情") {

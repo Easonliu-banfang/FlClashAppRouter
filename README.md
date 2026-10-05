@@ -4,7 +4,7 @@
 
 > 为什么需要它：FLClash 的「应用分流」面板 **只有 Android 端有**（基于 uid），macOS 端官方没做。本工具用进程名规则补上这一块。
 
-**当前版本：v2.7** · [下载最新版 DMG](https://github.com/Easonliu-banfang/FlClashAppRouter/releases/latest)
+**当前版本：v2.8** · [下载最新版 DMG](https://github.com/Easonliu-banfang/FlClashAppRouter/releases/latest)
 
 ---
 

@@ -90,6 +90,12 @@ final class AppRouterModel: ObservableObject {
     @Published var prereqChecked = false
     /// 诊断信息：把实际读到的原始值摊开，万一检测有误用户能直接看到原因
     @Published var prereqDiagnostics: String = ""
+    /// 当前问题能否自动修复（读不到 FLClash 设置时不能）
+    @Published var prereqAutoFixable = true
+    /// 自动修复进行中
+    @Published var isAutoFixing = false
+    /// 自动修复的结果提示（显示在拦截页上）
+    @Published var autoFixMessage: String = ""
     /// FLClash 当前状态标签（如「规则模式 · TUN 已开」），标题栏实时展示用。
     /// 与 prereqIssues 一样由 1 秒轮询刷新。
     @Published var flclashStatusLabel: String = ""
@@ -1011,7 +1017,9 @@ final class AppRouterModel: ObservableObject {
                         hint: "请先安装并至少启动一次 FLClash"
                             + "（https://github.com/chen08209/FlClash），再点「重新检测」。")
                 ]
-                applyPrereq(issues: issues, label: "", diagnostics: "未找到 UserDefaults 与 config.yaml")
+                applyPrereq(
+                    issues: issues, label: "",
+                    diagnostics: "未找到 UserDefaults 与 config.yaml", autoFixable: false)
                 return
             }
             let lines = text.components(separatedBy: "\n")
@@ -1107,18 +1115,23 @@ final class AppRouterModel: ObservableObject {
             "tun.enable: \(tunKnown ? (tunOK ? "true" : "false") : "(未读到)")",
             "find-process-mode: \(fpmKnown ? (fpmOK ? "ok" : "off") : "(未读到)")",
         ].joined(separator: "\n")
-        applyPrereq(issues: issues, label: newLabel, diagnostics: diag)
+        applyPrereq(
+            issues: issues, label: newLabel, diagnostics: diag,
+            autoFixable: (source == "patchClashConfig"))
     }
 
     /// 把检测结果落到 @Published 上。**只在内容真的变化时才赋值**——
     /// 本函数被 1 秒轮询调用，无条件赋值会让整个界面每秒重绘一次；
     /// 而且 PrereqIssue 带 UUID，每次重建都会让 ForEach 认为全是新行。
-    private func applyPrereq(issues: [PrereqIssue], label: String, diagnostics: String) {
+    private func applyPrereq(
+        issues: [PrereqIssue], label: String, diagnostics: String, autoFixable: Bool = true
+    ) {
         let newSig = issues.map { $0.title }.joined(separator: "|")
         let oldSig = prereqIssues.map { $0.title }.joined(separator: "|")
         if newSig != oldSig { prereqIssues = issues }
         if flclashStatusLabel != label { flclashStatusLabel = label }
         if prereqDiagnostics != diagnostics { prereqDiagnostics = diagnostics }
+        if prereqAutoFixable != autoFixable { prereqAutoFixable = autoFixable }
         if !prereqChecked { prereqChecked = true }
     }
 
@@ -1129,6 +1142,95 @@ final class AppRouterModel: ObservableObject {
         open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         open.arguments = ["-a", appPath]
         try? open.run()
+    }
+
+    /// 备份 FLClash 当前设置到缓存目录，返回备份路径（写坏时的还原依据）
+    private func backupFlclashConfig() -> String? {
+        guard let suite = UserDefaults(suiteName: "com.follow.clash"),
+              let raw = suite.string(forKey: "flutter.config") else { return nil }
+        let dir = NSString(string: "~/Library/Caches/FlClashAppRouter").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent("flclash-config-backup.json")
+        guard (try? raw.write(toFile: path, atomically: true, encoding: .utf8)) != nil else {
+            return nil
+        }
+        return path
+    }
+
+    /// 改写 FLClash 的 patchClashConfig 并写回 UserDefaults，返回是否成功（带回读校验）。
+    /// 已实测 JSON 往返完全保真：13 个顶层键、27 个 patch 键、Int64/Double/Bool 类型都不变。
+    private func patchFlclashConfig(_ mutate: (inout [String: Any]) -> Void) -> Bool {
+        guard let suite = UserDefaults(suiteName: "com.follow.clash") else { return false }
+        _ = suite.synchronize()
+        guard let raw = suite.string(forKey: "flutter.config"),
+              let data = raw.data(using: .utf8),
+              var obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              var patch = obj["patchClashConfig"] as? [String: Any]
+        else { return false }
+        mutate(&patch)
+        obj["patchClashConfig"] = patch
+        guard let out = try? JSONSerialization.data(withJSONObject: obj),
+              let str = String(data: out, encoding: .utf8) else { return false }
+        suite.set(str, forKey: "flutter.config")
+        _ = suite.synchronize()
+        // 缓存失效，立刻能读到新值
+        cachedConfigRaw = nil
+        cachedConfigJSON = nil
+        // 回读校验：只核对本次改的关键字段是否真的落盘
+        guard let check = flclashConfigJSON(),
+              let cp = check["patchClashConfig"] as? [String: Any] else { return false }
+        let m = (cp["mode"] as? String)?.lowercased()
+        let f = (cp["find-process-mode"] as? String)?.lowercased()
+        let t = (cp["tun"] as? [String: Any])?["enable"] as? Bool
+        return m == "rule" && f == "always" && t == true
+    }
+
+    /// 自动修复：把 FLClash 的三项设置改成「能让按软件分流生效」的值，然后重启它。
+    /// **顺序很关键：先退出 FLClash 再写设置**——FLClash 退出时会把内存里的设置写回
+    /// UserDefaults，先写会被它覆盖。写完再拉起，它会用新设置重新生成 config.yaml。
+    func autoFix() {
+        guard !isAutoFixing else { return }
+        isAutoFixing = true
+        autoFixMessage = ""
+        DispatchQueue.global(qos: .userInitiated).async {
+            let backup = self.backupFlclashConfig()
+            // 1) 先让 FLClash 完全退出，避免它退出时覆盖我们写入的值
+            self.killProcess("FlClash")
+            self.waitProcessGone("FlClash")
+            self.killProcess("FlClashCore")
+            self.waitProcessGone("FlClashCore")
+            // 2) 写设置：TUN 开、find-process-mode 为 always、模式为规则
+            let ok = self.patchFlclashConfig { patch in
+                var tun = (patch["tun"] as? [String: Any]) ?? [:]
+                tun["enable"] = true
+                if tun["stack"] == nil { tun["stack"] = "mixed" }
+                if tun["device"] == nil { tun["device"] = "FlClash" }
+                if tun["dns-hijack"] == nil { tun["dns-hijack"] = ["any:53"] }
+                patch["tun"] = tun
+                patch["find-process-mode"] = "always"
+                patch["mode"] = "rule"
+            }
+            // 3) 重新拉起 FLClash，让它按新设置重新生成 config.yaml
+            if ok {
+                self.openFlClash()
+                Thread.sleep(forTimeInterval: 3.0)
+            }
+            DispatchQueue.main.async {
+                self.isAutoFixing = false
+                self.cachedConfigRaw = nil
+                self.cachedConfigJSON = nil
+                self.checkPrerequisites()
+                if !ok {
+                    self.autoFixMessage =
+                        "自动修复失败：无法写入 FLClash 设置。"
+                        + (backup.map { "原设置已备份到 \($0)" } ?? "")
+                } else if self.prereqIssues.isEmpty {
+                    self.autoFixMessage = "已自动修复，FLClash 已重启"
+                } else {
+                    self.autoFixMessage = "已写入设置并重启 FLClash，但仍有未满足项，请按提示手动处理"
+                }
+            }
+        }
     }
 
     /// 定时轮询 FLClash 设置（TUN / find-process-mode / 模式），1 秒一次。
@@ -1191,31 +1293,36 @@ final class AppRouterModel: ObservableObject {
 
     /// 写/恢复后自动重载 FLClash：关掉 GUI + 内核再重新拉起，让新配置生效（免去手动重启）。
     /// 必须在后台线程跑（里面有等待），不要在主线程/界面重绘时调用。
+    /// killall 指定进程（阻塞到命令返回）
+    private func killProcess(_ name: String) {
+        let k = Process()
+        k.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        k.arguments = [name]
+        try? k.run()
+        k.waitUntilExit()
+    }
+
+    /// 轮询等进程真正退出（最多 ~3s），避免紧接着 open 时旧进程还在
+    private func waitProcessGone(_ name: String) {
+        for _ in 0..<30 {
+            let chk = Process()
+            chk.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            chk.arguments = ["-x", name]
+            let pipe = Pipe()
+            chk.standardOutput = pipe
+            try? chk.run()
+            chk.waitUntilExit()
+            let out = String(
+                data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                encoding: .utf8) ?? ""
+            if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+
     func reloadFlClash() {
-        func kill(_ name: String) {
-            let k = Process()
-            k.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
-            k.arguments = [name]
-            try? k.run()
-            k.waitUntilExit()
-        }
-        // 等进程真正退出（最多 ~3s），避免 open 时旧进程还在
-        func waitGone(_ name: String) {
-            for _ in 0..<30 {
-                let chk = Process()
-                chk.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-                chk.arguments = ["-x", name]
-                let pipe = Pipe()
-                chk.standardOutput = pipe
-                try? chk.run()
-                chk.waitUntilExit()
-                let out = String(
-                    data: pipe.fileHandleForReading.readDataToEndOfFile(),
-                    encoding: .utf8) ?? ""
-                if out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { break }
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-        }
+        let kill = killProcess
+        let waitGone = waitProcessGone
         // 1) 先关 GUI 并等其彻底退出（关键：否则 GUI 可能在后台把内核用旧配置重新拉起，导致重载失效）
         // 记录重载前 config.yaml 修改时间，用于后面等它真正重新生成
         let beforeMtime =
