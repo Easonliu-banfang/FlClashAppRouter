@@ -1,0 +1,15 @@
+# ── 构建产物（不入库，改用 GitHub Release 分发 DMG）──
+.build/
+*.app/
+*.dmg
+
+# swiftc / lipo 产出的裸二进制
+/FlClashAppRouter
+/FlClashAppRouter.arm64
+/FlClashAppRouter.x86_64
+
+# iconset 可由 Assets/AppIcon-source.jpg 用 sips 重新生成
+Assets/AppIcon.iconset/
+
+# ── 系统垃圾 ──
+.DS_Store
